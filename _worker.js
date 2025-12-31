@@ -29,133 +29,7 @@ const PT_TYPE = 'v'+'l'+'e'+'s'+'s';
 // =============================================================================
 const MAX_PENDING=2097152,KEEPALIVE=15000,STALL_TO=8000,MAX_STALL=12,MAX_RECONN=24;
 const buildUUID=(a,i)=>[...a.slice(i,i+16)].map(n=>n.toString(16).padStart(2,'0')).join('').replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/,'$1-$2-$3-$4-$5');
-const extractAddr=b=>{const o=18+b[17]+1,p=(b[o]<<8)|b[o+1],t=b[o+2];let l,h,O=o+3;switch(t){case 1:l=4;h=b.slice(O,O+l).join('.');break;case 2:l=b[O++];h=new TextDecoder().decode(b.slice(O,O+l));break;case 3:l=16;h=`[${[...Array(8)].map((_,i)=>((b[O+i*2]<<8)|b[O+i*2+1]).toString(16)).join(':')}]`;break;default:throw new Error('Addr type error');}return{host:h,port:p,payload:b.slice(O+l),addressType:t}};
-
-// -----------------------------------------------------------------------------
-// 🔧 全功能：地址解析与代理连接 【新增socks5 https全局】
-// -----------------------------------------------------------------------------
-const parseAddressPort = (seg) => {
-  if (seg.startsWith("[")) {
-    const m = seg.match(/^\[(.+?)\]:(\d+)$/);
-    if (m) return [m[1], Number(m[2])];
-    return [seg.slice(1, -1), 443];
-  }
-  const [addr, port = 443] = seg.split(":");
-  return [addr, Number(port)];
-};
-
-const socks5AddressParser = (raw) => {
-  let username, password, hostname, port;
-  if (raw.includes('://') && !raw.match(/^(socks5?|https?):\/\//i)) {
-    const u = new URL(raw);
-    hostname = u.hostname;
-    port = u.port || (u.protocol === 'http:' ? 80 : 1080);
-    const auth = u.username || u.password ? `${u.username}:${u.password}` : u.username;
-    if (auth && auth.includes(':')) [username, password] = auth.split(':');
-    else if (auth) {
-      try { const dec = atob(auth.replace(/%3D/g, '=').padEnd(auth.length + (4 - auth.length % 4) % 4, '='));
-            const p = dec.split(':'); if (p.length === 2) [username, password] = p; } catch {}
-    }
-  } else {
-    let authPart = '', hostPart = raw;
-    const at = raw.lastIndexOf('@');
-    if (at !== -1) { authPart = raw.substring(0, at); hostPart = raw.substring(at + 1); }
-    if (authPart && !authPart.includes(':')) {
-      try { const dec = atob(authPart.replace(/%3D/g, '=').padEnd(authPart.length + (4 - authPart.length % 4) % 4, '='));
-            const p = dec.split(':'); if (p.length === 2) [username, password] = p; } catch {}
-    }
-    if (!username && authPart && authPart.includes(':')) [username, password] = authPart.split(':');
-    const [h, p] = parseAddressPort(hostPart);
-    hostname = h; port = p || (raw.includes('http=') ? 80 : 1080);
-  }
-  if (!hostname || isNaN(port)) throw new Error("Invalid proxy config");
-  return { username, password, hostname, port };
-};
-
-async function socks5Connect(addressType, addressRemote, portRemote, cfg) {
-  const { username, password, hostname, port } = cfg;
-  const socket = connect({ hostname, port });
-  const writer = socket.writable.getWriter();
-  await writer.write(new Uint8Array([5, username ? 2 : 1, 0, username ? 2 : 0]));
-  const reader = socket.readable.getReader();
-  const enc = new TextEncoder();
-  let resp = (await reader.read()).value;
-  if (resp[1] === 2) {
-    const auth = new Uint8Array([1, username.length, ...enc.encode(username), password.length, ...enc.encode(password)]);
-    await writer.write(auth);
-    resp = (await reader.read()).value;
-    if (resp[1] !== 0) throw new Error("SOCKS5 auth failed");
-  }
-  let DST;
-  if (addressType === 1) DST = new Uint8Array([1, ...addressRemote.split(".").map(Number)]);
-  else if (addressType === 2) DST = new Uint8Array([3, addressRemote.length, ...enc.encode(addressRemote)]);
-  else if (addressType === 3) {
-    const bytes = addressRemote.slice(1, -1).split(':').flatMap(h => [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16)]);
-    DST = new Uint8Array([4, ...bytes]);
-  }
-  await writer.write(new Uint8Array([5, 1, 0, ...DST, (portRemote >> 8) & 0xff, portRemote & 0xff]));
-  resp = (await reader.read()).value;
-  if (resp[1] !== 0) throw new Error("SOCKS5 connect failed");
-  writer.releaseLock(); reader.releaseLock();
-  return socket;
-}
-
-async function httpConnect(addressType, addressRemote, portRemote, cfg) {
-  const { username, password, hostname, port } = cfg;
-  const sock = connect({ hostname, port });
-  let req = `CONNECT ${addressRemote}:${portRemote} HTTP/1.1\r\nHost: ${addressRemote}:${portRemote}\r\n`;
-  if (username && password) req += `Proxy-Authorization: Basic ${btoa(`${username}:${password}`)}\r\n`;
-  req += `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36\r\nConnection: keep-alive\r\n\r\n`;
-  const writer = sock.writable.getWriter();
-  await writer.write(new TextEncoder().encode(req));
-  writer.releaseLock();
-  const reader = sock.readable.getReader();
-  let buf = new Uint8Array(0);
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) throw new Error("HTTP proxy closed unexpectedly");
-    const tmp = new Uint8Array(buf.length + value.length);
-    tmp.set(buf); tmp.set(value, buf.length); buf = tmp;
-    if (buf.length > 65536) throw new Error("HTTP proxy response too large");
-    const txt = new TextDecoder().decode(buf);
-    if (txt.includes("\r\n\r\n")) {
-      if (/^HTTP\/1\.[01] 2/i.test(txt.split("\r\n")[0])) {
-        reader.releaseLock();
-        return sock;
-      }
-      throw new Error(`HTTP proxy refused: ${txt.split("\r\n")[0]}`);
-    }
-  }
-}
-
-function parseProxyConfig(path) {
-  let proxyIP = null, socks5 = null, enableSocks = null, globalProxy = null;
-  const globalMatch = path.match(/(socks5?|https?):\/\/([^/#?]+)/i);
-  if (globalMatch) {
-    const cfg = socks5AddressParser(globalMatch[2]);
-    globalProxy = {
-      type: globalMatch[1].toLowerCase().includes('5') || globalMatch[1] === 'socks' ? 'socks5' : 'http',
-      cfg
-    };
-    return { proxyIP, socks5, enableSocks, globalProxy };
-  }
-  const ipMatch = path.match(/(?:^|\/)(?:proxy)?ip[=\/]([^?#]+)/i);
-  if (ipMatch) {
-    const seg = ipMatch[1];
-    const [addr, port = 443] = parseAddressPort(seg);
-    proxyIP = {
-      address: addr.includes('[') ? addr.slice(1, -1) : addr,
-      port: +port
-    };
-  }
-  const localMatch = path.match(/(?:^|\/)(socks5?|s5|http)[=\/]([^/#?]+)/i);
-  if (localMatch) {
-    const seg = localMatch[2];
-    socks5 = socks5AddressParser(seg);
-    enableSocks = localMatch[1].toLowerCase().includes('http') ? 'http' : 'socks5';
-  }
-  return { proxyIP, socks5, enableSocks, globalProxy };
-}
+const extractAddr=b=>{const o=18+b[17]+1,p=(b[o]<<8)|b[o+1],t=b[o+2];let l,h,O=o+3;switch(t){case 1:l=4;h=b.slice(O,O+l).join('.');break;case 2:l=b[O++];h=new TextDecoder().decode(b.slice(O,O+l));break;case 3:l=16;h=`[${[...Array(8)].map((_,i)=>((b[O+i*2]<<8)|b[O+i*2+1]).toString(16)).join(':')}]`;break;default:throw new Error('Addr type error');}return{host:h,port:p,payload:b.slice(O+l)}};
 
 // -----------------------------------------------------------------------------
 // 🗄️ 存储与配置读取
@@ -212,23 +86,83 @@ async function getAllWhitelist(env) {
     return result;
 }
 
-async function logAccess(env, ip, region, action) {
-    if (!env.DB) return;
+/**
+ * 🛡️ [优化] 日志记录函数 (D1 & KV 双保险防爆)
+ */
+async function logAccess(env, ctx, ip, region, action) {
+    // ⚠️ 全局采样保护：如果是高频操作（如订阅），只记录 20% 的日志
+    // 无论 D1 还是 KV，都防止被刷爆额度
+    if ((action.includes("订阅") || action.includes("检测")) && Math.random() > 0.2) {
+        return;
+    }
+
     const time = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-    try {
-        await env.DB.prepare("INSERT INTO logs (time, ip, region, action) VALUES (?, ?, ?, ?)").bind(time, ip, region, action).run();
-        await env.DB.prepare("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT 1000)").run();
-    } catch (e) {}
+    
+    // 1. D1 数据库 (异步写入)
+    if (env.DB) {
+        ctx.waitUntil(async function() {
+            try {
+                await env.DB.prepare("INSERT INTO logs (time, ip, region, action) VALUES (?, ?, ?, ?)").bind(time, ip, region, action).run();
+                // 自动清理旧日志 (保留1000条)
+                await env.DB.prepare("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT 1000)").run();
+            } catch (e) {}
+        }());
+        return;
+    }
+
+    // 2. KV 空间 (降级方案 + CPU优化)
+    if (env.LH) {
+        ctx.waitUntil(async function() {
+            try {
+                let currentLogs = await env.LH.get('ACCESS_LOGS') || "";
+                if (currentLogs.length > 30000) currentLogs = ""; // 长度保护
+                let logLines = currentLogs.split('\n').filter(Boolean);
+                const newLog = `${time}|${ip}|${region}|${action}`;
+                logLines.unshift(newLog);
+                if (logLines.length > 30) logLines = logLines.slice(0, 30);
+                await env.LH.put('ACCESS_LOGS', logLines.join('\n'));
+            } catch(e) {}
+        }());
+    }
 }
 
+/**
+ * 🛡️ [优化] 每日统计函数 (D1 额度保护版)
+ * - D1: 开启 1% 采样写入，防止 10万次/天 的额度被耗尽
+ * - KV: 保持只读
+ */
 async function incrementDailyStats(env) {
-    if (!env.DB) return "0";
-    const dateStr = new Date().toISOString().split('T')[0];
-    try {
-        await env.DB.prepare(`INSERT INTO stats (date, count) VALUES (?, 1) ON CONFLICT(date) DO UPDATE SET count = count + 1`).bind(dateStr).run();
-        const { results } = await env.DB.prepare("SELECT count FROM stats WHERE date = ?").bind(dateStr).all();
-        return results[0]?.count?.toString() || "1";
-    } catch(e) { return "0"; }
+    // D1 逻辑 (采样写入)
+    if (env.DB) {
+        // 采样率：100 (每 100 次请求，才写一次数据库)
+        // 这样每天可以承受 1000万次请求而不爆 D1 额度
+        const SAMPLE_RATE = 100;
+        
+        if (Math.random() < (1 / SAMPLE_RATE)) {
+            const dateStr = new Date().toISOString().split('T')[0];
+            try {
+                // 写入时直接 +100
+                await env.DB.prepare(`INSERT INTO stats (date, count) VALUES (?, ${SAMPLE_RATE}) ON CONFLICT(date) DO UPDATE SET count = count + ${SAMPLE_RATE}`).bind(dateStr).run();
+            } catch(e) {}
+        }
+        
+        // 读取时不采样，尽量返回当前值 (可能稍微滞后，但安全)
+        try {
+            const dateStr = new Date().toISOString().split('T')[0];
+            const { results } = await env.DB.prepare("SELECT count FROM stats WHERE date = ?").bind(dateStr).all();
+            return results[0]?.count?.toString() || "0";
+        } catch(e) { return "0"; }
+    }
+    
+    // KV 逻辑 (只读 - 真正写入在 safeUpdateKVStats)
+    if (env.LH) {
+        try {
+            const count = await env.LH.get("KV_TOTAL_REQ");
+            return count || "0";
+        } catch(e) { return "0"; }
+    }
+    
+    return "0";
 }
 
 async function parseIP(p){
@@ -295,47 +229,29 @@ async function sendTgMsg(ctx, env, title, r, detail = "", isAdmin = false) {
   } catch(e) {}
 }
 
-const handle = (ws, pc, uuid, socks5, enableSocks, globalProxy) => {
-  const pool = new Pool(); let s, w, r, inf, fst = true, rx = 0, stl = 0, cnt = 0, lact = Date.now(), con = false, rd = false, wt = false, tm = {}, pd = [], pb = 0, scr = 1.0, lck = Date.now(), lrx = 0, md = 'buf', asz = 0, tp = [], st = { t: 0, c: 0, ts: Date.now() }, succ = 0, fail = 0;
-  const upd = sz => { st.t += sz; st.c++; asz = asz * 0.9 + sz * 0.1; const n = Date.now(); if (n - st.ts > 1000) { const rt = st.t; tp.push(rt); if (tp.length > 5) tp.shift(); st.t = 0; st.ts = n; const av = tp.reduce((a, b) => a + b, 0) / tp.length; if (st.c >= 20) { if (av > 2e7 && asz > 16384) md = 'dir'; else if (av < 1e7 || asz < 8192) md = 'buf'; else md = 'adp' } } };
-  const rdL = async () => { if (rd) return; rd = true; let b = [], bz = 0, bTmr = null; const fl = () => { if (!bz) return; const m = new Uint8Array(bz); let p = 0; for (const x of b) { m.set(x, p); p += x.length } if (ws.readyState === 1) ws.send(m); b = []; bz = 0; if (bTmr) clearTimeout(bTmr); bTmr = null }; try { while (1) { if (pb > MAX_PENDING) { await new Promise(r => setTimeout(r, 100)); continue } const { done, value: v } = await r.read(); if (v?.length) { rx += v.length; lact = Date.now(); stl = 0; upd(v.length); const n = Date.now(); if (n - lck > 5000) { const el = n - lck, by = rx - lrx, rate = by / el; if (rate > 500) scr = Math.min(1, scr + 0.05); else if (rate < 50) scr = Math.max(0.1, scr - 0.05); lck = n; lrx = rx } if (md === 'buf') { if (v.length < 32768) { b.push(v); bz += v.length; if (bz >= 131072) fl(); else if (!bTmr) bTmr = setTimeout(fl, asz > 16384 ? 5 : 20) } else { fl(); if (ws.readyState === 1) ws.send(v) } } else { fl(); if (ws.readyState === 1) ws.send(v) } } if (done) { fl(); rd = false; rcn(); break } } } catch { fl(); rd = false; fail++; rcn() } };
-  const wtL = async () => { if (wt) return; wt = true; try { while (wt) { if (!w) { await new Promise(r => setTimeout(r, 100)); continue } if (!pd.length) { await new Promise(r => setTimeout(r, 20)); continue } const b = pd.shift(); await w.write(b); pb -= b.length; pool.free(b) } } catch { wt = false } };
-
-  const tryConnect = async (host, port, addressType) => {
-    if (globalProxy) {
-      if (globalProxy.type === 'socks5') return await socks5Connect(addressType, host, port, globalProxy.cfg);
-      if (globalProxy.type === 'http') return await httpConnect(addressType, host, port, globalProxy.cfg);
-    }
-    try {
-      const socket = connect({ hostname: host, port });
-      if (socket.opened) await socket.opened;
-      return socket;
-    } catch (err) {
-      if (!socks5 && !pc) throw err;
-      if (socks5) {
-        try {
-          const localSocket = enableSocks === 'http' ? await httpConnect(addressType, host, port, socks5) : await socks5Connect(addressType, host, port, socks5);
-          if (localSocket.opened) await localSocket.opened;
-          return localSocket;
-        } catch {}
-      }
-      if (pc) {
-        try {
-          const proxySocket = connect({ hostname: pc.address, port: pc.port });
-          if (proxySocket.opened) await proxySocket.opened;
-          return proxySocket;
-        } catch {}
-      }
-      throw err;
-    }
+const handle = (ws, pc, uuid) => {
+  const pool = new Pool(); 
+  // 🛡️ CPU 修复：强制直通模式 ('dir')
+  let s, w, r, inf, fst = true, rx = 0, stl = 0, cnt = 0, lact = Date.now(), con = false, rd = false, wt = false, tm = {}, pd = [], pb = 0, scr = 1.0, lck = Date.now(), lrx = 0, md = 'dir', asz = 0, tp = [], st = { t: 0, c: 0, ts: Date.now() };
+  
+  const upd = sz => { 
+      st.t += sz; st.c++; asz = asz * 0.9 + sz * 0.1; 
+      const n = Date.now(); 
+      if (n - st.ts > 1000) { 
+          const rt = st.t; tp.push(rt); if (tp.length > 5) tp.shift(); st.t = 0; st.ts = n; 
+          md = 'dir'; // 始终保持高效模式
+      } 
   };
 
-  const est = async () => { try { s = await tryConnect(inf.host, inf.port, inf.addressType); w = s.writable.getWriter(); r = s.readable.getReader(); con = false; cnt = 0; scr = Math.min(1, scr + 0.15); succ++; lact = Date.now(); rdL(); wtL() } catch { con = false; fail++; scr = Math.max(0.1, scr - 0.2); rcn() } };
-  const rcn = async () => { if (!inf || ws.readyState !== 1) { cln(); ws.close(1011); return } if (cnt >= MAX_RECONN) { cln(); ws.close(1011); return } if (scr < 0.3 && cnt > 5 && Math.random() > 0.6) { cln(); ws.close(1011); return } if (con) return; cnt++; let d = Math.min(50 * Math.pow(1.5, cnt - 1), 3000) * (1.5 - scr * 0.5); d += (Math.random() - 0.5) * d * 0.2; d = Math.max(50, Math.floor(d)); try { csk(); if (pb > MAX_PENDING * 2) while (pb > MAX_PENDING && pd.length > 5) { const k = pd.shift(); pb -= k.length; pool.free(k) } await new Promise(r => setTimeout(r, d)); con = true; s = await tryConnect(inf.host, inf.port, inf.addressType); w = s.writable.getWriter(); r = s.readable.getReader(); const bt = pd.splice(0, 10); for (const b of bt) { await w.write(b); pb -= b.length; pool.free(b) } con = false; cnt = 0; scr = Math.min(1, scr + 0.15); succ++; stl = 0; lact = Date.now(); rdL(); wtL() } catch { con = false; fail++; scr = Math.max(0.1, scr - 0.2); if (cnt < MAX_RECONN && ws.readyState === 1) setTimeout(rcn, 500); else { cln(); ws.close(1011) } } };
+  const rdL = async () => { if (rd) return; rd = true; let b = [], bz = 0, tm = null; const fl = () => { if (!bz) return; const m = new Uint8Array(bz); let p = 0; for (const x of b) { m.set(x, p); p += x.length } if (ws.readyState === 1) ws.send(m); b = []; bz = 0; if (tm) clearTimeout(tm); tm = null }; try { while (1) { if (pb > MAX_PENDING) { await new Promise(r => setTimeout(r, 100)); continue } const { done, value: v } = await r.read(); if (v?.length) { rx += v.length; lact = Date.now(); stl = 0; upd(v.length); const n = Date.now(); if (n - lck > 5000) { const el = n - lck, by = rx - lrx, r = by / el; if (r > 500) scr = Math.min(1, scr + 0.05); else if (r < 50) scr = Math.max(0.1, scr - 0.05); lck = n; lrx = rx } if (md === 'buf') { if (v.length < 32768) { b.push(v); bz += v.length; if (bz >= 131072) fl(); else if (!tm) tm = setTimeout(fl, asz > 16384 ? 5 : 20) } else { fl(); if (ws.readyState === 1) ws.send(v) } } else { fl(); if (ws.readyState === 1) ws.send(v) } } if (done) { fl(); rd = false; rcn(); break } } } catch { fl(); rd = false; rcn() } };
+  const wtL = async () => { if (wt) return; wt = true; try { while (wt) { if (!w) { await new Promise(r => setTimeout(r, 100)); continue } if (!pd.length) { await new Promise(r => setTimeout(r, 20)); continue } const b = pd.shift(); await w.write(b); pb -= b.length; pool.free(b) } } catch { wt = false } };
+  const est = async () => { try { s = await cn(); w = s.writable.getWriter(); r = s.readable.getReader(); con = false; cnt = 0; scr = Math.min(1, scr + 0.15); lact = Date.now(); rdL(); wtL() } catch { con = false; scr = Math.max(0.1, scr - 0.2); rcn() } };
+  const cn = async () => { const m = ['direct']; if (pc) m.push('proxy'); let err; for (const x of m) { try { const o = (x === 'direct') ? { hostname: inf.host, port: inf.port } : { hostname: pc.address, port: pc.port }; const sk = connect(o); await sk.opened; return sk } catch (e) { err = e } } throw err };
+  const rcn = async () => { if (!inf || ws.readyState !== 1) { cln(); ws.close(1011); return } if (cnt >= MAX_RECONN) { cln(); ws.close(1011); return } if (con) return; cnt++; let d = Math.min(50 * Math.pow(1.5, cnt - 1), 3000) * (1.5 - scr * 0.5); d = Math.max(50, Math.floor(d)); try { csk(); if (pb > MAX_PENDING * 2) while (pb > MAX_PENDING && pd.length > 5) { const k = pd.shift(); pb -= k.length; pool.free(k) } await new Promise(r => setTimeout(r, d)); con = true; s = await cn(); w = s.writable.getWriter(); r = s.readable.getReader(); con = false; cnt = 0; scr = Math.min(1, scr + 0.15); stl = 0; lact = Date.now(); rdL(); wtL() } catch { con = false; scr = Math.max(0.1, scr - 0.2); if (cnt < MAX_RECONN && ws.readyState === 1) setTimeout(rcn, 500); else { cln(); ws.close(1011) } } };
   const stT = () => { tm.ka = setInterval(async () => { if (!con && w && Date.now() - lact > KEEPALIVE) try { await w.write(new Uint8Array(0)); lact = Date.now() } catch { rcn() } }, KEEPALIVE / 3); tm.hc = setInterval(() => { if (!con && st.t > 0 && Date.now() - lact > STALL_TO) { stl++; if (stl >= MAX_STALL) { if (cnt < MAX_RECONN) { stl = 0; rcn() } else { cln(); ws.close(1011) } } } }, STALL_TO / 2) };
-  const csk = () => { rd = false; wt = false; try { w?.releaseLock(); r?.releaseLock(); s?.close() } catch { } };
-  const cln = () => { Object.values(tm).forEach(clearInterval); csk(); while (pd.length) pool.free(pd.shift()); pb = 0; st = { t: 0, c: 0, ts: Date.now() }; md = 'buf'; asz = 0; tp = []; pool.reset() };
-  ws.addEventListener('message', async e => { try { if (fst) { fst = false; const b = new Uint8Array(e.data); if (buildUUID(b, 1).toLowerCase() !== uuid.toLowerCase()) throw 0; ws.send(new Uint8Array([0, 0])); const { host, port, payload, addressType } = extractAddr(b); inf = { host, port, addressType }; con = true; if (payload.length) { const z = pool.alloc(payload.length); z.set(payload); pd.push(z); pb += z.length } stT(); est() } else { lact = Date.now(); if (pb > MAX_PENDING * 2) return; const z = pool.alloc(e.data.byteLength); z.set(new Uint8Array(e.data)); pd.push(z); pb += z.length } } catch { cln(); ws.close(1006) } });
+  const csk = () => { rd = false; wt = false; try { w?.releaseLock(); r?.releaseLock(); s?.close() } catch { } }; 
+  const cln = () => { Object.values(tm).forEach(clearInterval); csk(); while (pd.length) pool.free(pd.shift()); pb = 0; st = { t: 0, c: 0, ts: Date.now() }; md = 'dir'; asz = 0; tp = []; pool.reset() };
+  ws.addEventListener('message', async e => { try { if (fst) { fst = false; const b = new Uint8Array(e.data); if (buildUUID(b, 1).toLowerCase() !== uuid.toLowerCase()) throw 0; ws.send(new Uint8Array([0, 0])); const { host, port, payload } = extractAddr(b); inf = { host, port }; con = true; if (payload.length) { const z = pool.alloc(payload.length); z.set(payload); pd.push(z); pb += z.length } stT(); est() } else { lact = Date.now(); if (pb > MAX_PENDING * 2) return; const z = pool.alloc(e.data.byteLength); z.set(new Uint8Array(e.data)); pd.push(z); pb += z.length } } catch { cln(); ws.close(1006) } });
   ws.addEventListener('close', cln); ws.addEventListener('error', cln)
 };
 
@@ -764,14 +680,56 @@ function dashPage(host, uuid, proxyip, subpass, subdomain, converter, env, clien
 </html>`;
 }
 
-// 导出放在最后，确保所有函数都已定义
+// =============================================================================
+// 🟢 核心逻辑：强制不缓存的 Headers 定义
+// =============================================================================
+const strictCacheHeaders = {
+    'Content-Type': 'text/plain; charset=utf-8',
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
+    'Pragma': 'no-cache',
+    'Expires': '0',
+    'Surrogate-Control': 'no-store'
+};
+
+/**
+ * ✅ [新增] 安全统计 KV 写入函数 (防爆盾)
+ * 采用 1% 采样写入策略，将 10000 次写入压缩为 100 次
+ * 彻底解决 CPU 崩溃和 KV 爆满问题，同时不阻塞主线程
+ */
+async function safeUpdateKVStats(env, ctx) {
+    // 如果没有 KV 绑定 (env.LH)，直接跳过
+    if (!env.LH) return;
+
+    // 采样率：100 (每 100 次请求，才写一次 KV)
+    const SAMPLE_RATE = 100;
+
+    // Math.random() < 0.01 只有 1% 的几率执行写入
+    if (Math.random() < (1 / SAMPLE_RATE)) {
+        ctx.waitUntil(async function() {
+            try {
+                // 读取旧值 (KV 操作)
+                const current = await env.LH.get("KV_TOTAL_REQ");
+                // 写入时直接 +100，补回没写入的那 99 次
+                const newVal = parseInt(current || 0) + SAMPLE_RATE;
+                // 执行写入 (完全异步)
+                await env.LH.put("KV_TOTAL_REQ", newVal.toString());
+            } catch (e) {
+                // 忽略写入冲突错误，保命要紧
+                console.error("Stats Update Skipped:", e);
+            }
+        }());
+    }
+}
+
 export default {
   async fetch(r, env, ctx) { 
     try {
+      // 🟢 [核心修复] 调用防爆 KV 统计 (不阻塞，安全写入)
+      safeUpdateKVStats(env, ctx);
+      
       const url = new URL(r.url);
       const host = url.hostname; 
       const UA = (r.headers.get('User-Agent') || "").toLowerCase();
-      // 🟢 关键：提取 UA_L 供后续使用
       const UA_L = UA.toLowerCase();
       
       const clientIP = r.headers.get('cf-connecting-ip');
@@ -779,8 +737,7 @@ export default {
       const city = r.cf?.city || 'Unknown';
 
       // 加载变量
-      const _UUID = env.KEY ?
-      await getDynamicUUID(env.KEY, env.UUID_REFRESH || 86400) : (await getSafeEnv(env, 'UUID', UUID));
+      const _UUID = env.KEY ? await getDynamicUUID(env.KEY, env.UUID_REFRESH || 86400) : (await getSafeEnv(env, 'UUID', UUID));
       const _WEB_PW = await getSafeEnv(env, 'WEB_PASSWORD', WEB_PASSWORD);
       const _SUB_PW = await getSafeEnv(env, 'SUB_PASSWORD', SUB_PASSWORD);
       const _PROXY_IP = await getSafeEnv(env, 'PROXYIP', DEFAULT_PROXY_IP);
@@ -791,8 +748,6 @@ export default {
 
       if (_SUB_DOMAIN.includes("://")) _SUB_DOMAIN = _SUB_DOMAIN.split("://")[1];
       if (_SUB_DOMAIN.includes("/")) _SUB_DOMAIN = _SUB_DOMAIN.split("/")[0];
-      
-      // 🟢 核心修复：如果读取到的域名为空，强制使用当前请求的 Host
       if (!_SUB_DOMAIN || _SUB_DOMAIN.trim() === "") _SUB_DOMAIN = host;
 
       if (_CONVERTER.endsWith("/")) _CONVERTER = _CONVERTER.slice(0, -1);
@@ -802,24 +757,13 @@ export default {
           return new Response('Not Found', { status: 404 });
       }
 
-      // =================================================================
-      // 1. 🛡️ 检查是否为管理员 (白名单逻辑)
-      // =================================================================
-      let hardcodedIPs = [];
-      if (typeof ADMIN_IP !== 'undefined' && ADMIN_IP && ADMIN_IP.trim() !== '') {
-          hardcodedIPs = ADMIN_IP.split(',').map(s => s.trim());
-      }
       let isGlobalAdmin = await checkWhitelist(env, clientIP);
 
-      // =================================================================
-      // 2. 🟢 身份验证逻辑 (决定权限与内容)
-      // =================================================================
       let isValidUser = false; 
       let hasAuthCookie = false; 
 
       const paramUUID = url.searchParams.get('uuid');
       if (paramUUID && paramUUID.toLowerCase() === _UUID.toLowerCase()) isValidUser = true;
-
       if (_SUB_PW && url.pathname === `/${_SUB_PW}`) isValidUser = true;
 
       if (_WEB_PW) {
@@ -835,51 +779,29 @@ export default {
         }
       }
 
-      if (isGlobalAdmin) {
-          isValidUser = true;
-      }
-
-      if (env.DB || env.LH) ctx.waitUntil(incrementDailyStats(env));
-
+      if (isGlobalAdmin) isValidUser = true;
+      // 🟢 [优化] 这里只负责 D1 写入，KV 写入已移交 safeUpdateKVStats
+      if (env.DB) ctx.waitUntil(incrementDailyStats(env));
       if (url.pathname === '/favicon.ico') return new Response(null, { status: 404 });
       
-      // 🟢 API 接口
       const flag = url.searchParams.get('flag');
       if (flag) {
-          if (flag === 'github') {
-              await sendTgMsg(ctx, env, "🌟 用户点击了烈火项目", r, "来源: 登录页面直达链接", isGlobalAdmin);
-              return new Response(null, { status: 204 });
-          }
-          if (flag === 'log_proxy_check') {
-              await sendTgMsg(ctx, env, "🔍 用户点击了 ProxyIP 检测", r, "来源: 后台管理面板", isGlobalAdmin);
-              return new Response(null, { status: 204 });
-          }
-          if (flag === 'log_sub_test') {
-              await sendTgMsg(ctx, env, "🌟 用户点击了订阅测试", r, "来源: 后台管理面板", isGlobalAdmin);
-              return new Response(null, { status: 204 });
-          }
+          if (flag === 'github') { await sendTgMsg(ctx, env, "🌟 用户点击了烈火项目", r, "来源: 登录页面直达链接", isGlobalAdmin); return new Response(null, { status: 204 }); }
+          if (flag === 'log_proxy_check') { await sendTgMsg(ctx, env, "🔍 用户点击了 ProxyIP 检测", r, "来源: 后台管理面板", isGlobalAdmin); return new Response(null, { status: 204 }); }
+          if (flag === 'log_sub_test') { await sendTgMsg(ctx, env, "🌟 用户点击了订阅测试", r, "来源: 后台管理面板", isGlobalAdmin); return new Response(null, { status: 204 }); }
           if (flag === 'stats') {
+              // 这里会读取 KV 或 D1 的数据返回给前端
               let reqCount = await incrementDailyStats(env);
               const cfStats = await getCloudflareUsage(env);
               const finalReq = cfStats.success ? `${cfStats.total} (API)` : `${reqCount} (Internal)`;
               const hasKV = !!(env.DB || env.LH);
               const cfConfigured = cfStats.success || (!!await getSafeEnv(env, 'CF_EMAIL', "") && !!await getSafeEnv(env, 'CF_KEY', ""));
-              return new Response(JSON.stringify({
-                  req: finalReq,
-                  ip: clientIP,
-                  loc: `${city}, ${country}`,
-                  hasKV: hasKV,
-                  cfConfigured: cfConfigured
-              }), { headers: { 'Content-Type': 'application/json' } });
+              return new Response(JSON.stringify({ req: finalReq, ip: clientIP, loc: `${city}, ${country}`, hasKV: hasKV, cfConfigured: cfConfigured }), { headers: { 'Content-Type': 'application/json' } });
            }
           if (flag === 'get_logs') {
               if (!hasAuthCookie && !isGlobalAdmin) return new Response('403 Forbidden', { status: 403 });
-              if (env.DB) { try { const { results } = await env.DB.prepare("SELECT * FROM logs ORDER BY id DESC LIMIT 50").all();
-              return new Response(JSON.stringify({ type: 'd1', logs: results }), { headers: { 'Content-Type': 'application/json' } });
-              } catch(e) {} }
-              else if (env.LH) { try { const logs = await env.LH.get('ACCESS_LOGS') ||
-              ""; return new Response(JSON.stringify({ type: 'kv', logs: logs }), { headers: { 'Content-Type': 'application/json' } });
-              } catch(e) {} }
+              if (env.DB) { try { const { results } = await env.DB.prepare("SELECT * FROM logs ORDER BY id DESC LIMIT 50").all(); return new Response(JSON.stringify({ type: 'd1', logs: results }), { headers: { 'Content-Type': 'application/json' } }); } catch(e) {} }
+              else if (env.LH) { try { const logs = await env.LH.get('ACCESS_LOGS') || ""; return new Response(JSON.stringify({ type: 'kv', logs: logs }), { headers: { 'Content-Type': 'application/json' } }); } catch(e) {} }
               return new Response(JSON.stringify({ logs: "No Storage" }), { headers: { 'Content-Type': 'application/json' } });
           }
           if (flag === 'get_whitelist') { 
@@ -889,24 +811,20 @@ export default {
           }
           if (flag === 'add_whitelist' && r.method === 'POST') {
               if (!hasAuthCookie && !isGlobalAdmin) return new Response('403 Forbidden', { status: 403 });
-              const body = await r.json();
-              if(body.ip) await addWhitelist(env, body.ip);
+              const body = await r.json(); if(body.ip) await addWhitelist(env, body.ip);
               return new Response(JSON.stringify({status:'ok'}), {headers:{'Content-Type':'application/json'}});
           }
           if (flag === 'del_whitelist' && r.method === 'POST') {
               if (!hasAuthCookie && !isGlobalAdmin) return new Response('403 Forbidden', { status: 403 });
-              const body = await r.json();
-              if(body.ip) await delWhitelist(env, body.ip);
+              const body = await r.json(); if(body.ip) await delWhitelist(env, body.ip);
               return new Response(JSON.stringify({status:'ok'}), {headers:{'Content-Type':'application/json'}});
           }
           if (flag === 'validate_tg' && r.method === 'POST') {
-              const body = await r.json();
-              await sendTgMsg(ctx, { TG_BOT_TOKEN: body.TG_BOT_TOKEN, TG_CHAT_ID: body.TG_CHAT_ID }, "🤖 TG 推送可用性验证", r, "配置有效", true);
+              const body = await r.json(); await sendTgMsg(ctx, { TG_BOT_TOKEN: body.TG_BOT_TOKEN, TG_CHAT_ID: body.TG_CHAT_ID }, "🤖 TG 推送可用性验证", r, "配置有效", true);
               return new Response(JSON.stringify({success:true, msg:"验证消息已发送"}), {headers:{'Content-Type':'application/json'}});
            }
           if (flag === 'validate_cf' && r.method === 'POST') {
-              const body = await r.json();
-              const res = await getCloudflareUsage(body);
+              const body = await r.json(); const res = await getCloudflareUsage(body);
               return new Response(JSON.stringify({success:res.success, msg: res.success ? `验证通过: 总请求 ${res.total}` : `验证失败: ${res.msg}`}), {headers:{'Content-Type':'application/json'}});
            }
           if (flag === 'save_config' && r.method === 'POST') {
@@ -918,28 +836,22 @@ export default {
                       if (env.LH) await env.LH.put(k, v);
                   }
                   return new Response(JSON.stringify({status: 'ok'}), { headers: { 'Content-Type': 'application/json' } });
-              } catch(e) { return new Response(JSON.stringify({status: 'error', msg: e.toString()}), { headers: { 'Content-Type': 'application/json' } });
-              }
+              } catch(e) { return new Response(JSON.stringify({status: 'error', msg: e.toString()}), { headers: { 'Content-Type': 'application/json' } }); }
           }
       }
 
       // 🟢 订阅接口
       if (_SUB_PW && url.pathname === `/${_SUB_PW}`) {
-          ctx.waitUntil(logAccess(env, clientIP, `${city},${country}`, "订阅更新"));
+          // 🟢 [优化] 使用支持 KV 的日志函数，带采样
+          logAccess(env, ctx, clientIP, `${city},${country}`, "订阅更新");
           const isFlagged = url.searchParams.has('flag');
           if (!isFlagged) {
               try {
                   const _d = (s) => atob(s);
-                  const rules = [
-                      ['TWlob21v', 'bWlob21v'], ['RmxDbGFzaA==', 'ZmxjbGFzaA=='], ['Q2xhc2g=', 'Y2xhc2g='], ['Q2xhc2g=', 'bWV0YQ=='], ['Q2xhc2g=', 'c3Rhc2g='], ['SGlkZGlmeQ==', 'aGlkZGlmeQ=='], ['U2luZy1ib3g=', 'c2luZy1ib3g='], ['U2luZy1ib3g=', 'c2luZ2JveA=='], ['U2luZy1ib3g=', 'c2Zp'], ['U2luZy1ib3g=', 'Ym94'], ['djJyYXlOL0NvcmU=', 'djJyYXk='], ['U3VyZ2U=', 'c3VyZ2U='], ['UXVhbnR1bXVsdCBY', 'cXVhbnR1bXVsdA=='], ['U2hhZG93cm9ja2V0', 'c2hhZG93cm9ja2V0'], ['TG9vbg==', 'bG9vbg=='], ['SGFB', 'aGFwcA==']
-                  ];
-                  let cName = "VW5rbm93bg=="; 
-                  let isProxy = false;
-                  for (const [n, k] of rules) { 
-                      if (UA_L.includes(_d(k))) { cName = n; isProxy = true; break; } 
-                  }
+                  const rules = [['TWlob21v', 'bWlob21v'], ['RmxDbGFzaA==', 'ZmxjbGFzaA=='], ['Q2xhc2g=', 'Y2xhc2g='], ['Q2xhc2g=', 'bWV0YQ=='], ['Q2xhc2g=', 'c3Rhc2g='], ['SGlkZGlmeQ==', 'aGlkZGlmeQ=='], ['U2luZy1ib3g=', 'c2luZy1ib3g='], ['U2luZy1ib3g=', 'c2luZ2JveA=='], ['U2luZy1ib3g=', 'c2Zp'], ['U2luZy1ib3g=', 'Ym94'], ['djJyYXlOL0NvcmU=', 'djJyYXk='], ['U3VyZ2U=', 'c3VyZ2U='], ['UXVhbnR1bXVsdCBY', 'cXVhbnR1bXVsdA=='], ['U2hhZG93cm9ja2V0', 'c2hhZG93cm9ja220'], ['TG9vbg==', 'bG9vbg=='], ['SGFB', 'aGFwcA==']];
+                  let cName = "VW5rbm93bg=="; let isProxy = false;
+                  for (const [n, k] of rules) { if (UA_L.includes(_d(k))) { cName = n; isProxy = true; break; } }
                   if (!isProxy && (UA_L.includes(_d('bW96aWxsYQ==')) || UA_L.includes(_d('Y2hyb21l')))) cName = "QnJvd3Nlcg==";
-                  
                   const title = isProxy ? "🔄 快速订阅更新" : "🌐 访问快速订阅页";
                   const p = sendTgMsg(ctx, env, title, r, `类型: ${_d(cName)}`, isGlobalAdmin);
                   if(ctx && ctx.waitUntil) ctx.waitUntil(p);
@@ -948,27 +860,38 @@ export default {
 
           const requestProxyIp = url.searchParams.get('proxyip') || _PROXY_IP;
           const pathParam = requestProxyIp ? "/proxyip=" + requestProxyIp : "/";
-          // 🟢 修复：特征码混淆
           const subUrl = `https://${_SUB_DOMAIN}/sub?uuid=${_UUID}&encryption=none&security=tls&sni=${host}&alpn=h3&fp=random&allowInsecure=1&type=ws&host=${host}&path=${encodeURIComponent(pathParam)}`;
 
-          // 🟢 智能识别：如果是常见代理客户端，走转换 API
-          if (UA_L.includes('sing-box') || UA_L.includes('singbox') || UA_L.includes('clash') || UA_L.includes('meta') || UA_L.includes('loon') || UA_L.includes('surge')) {
+          // 🟢 智能识别：sing-box 优先使用 1.11，失败则尝试 1.12
+          if (UA_L.includes('sing-box') || UA_L.includes('singbox') || UA_L.includes('clash') || UA_L.includes('meta')) {
               const type = (UA_L.includes('clash') || UA_L.includes('meta')) ? 'clash' : 'singbox';
-              const config = type === 'clash' ? CLASH_CONFIG : SINGBOX_CONFIG_V12;
-              const subApi = `${_CONVERTER}/sub?target=${type}&url=${encodeURIComponent(subUrl)}&config=${encodeURIComponent(config)}&emoji=true&list=false&sort=false&fdn=false&scv=false`;
+              // ⚠️ 关键修改：默认使用 V11 (1.11.x)
+              let config = type === 'clash' ? CLASH_CONFIG : SINGBOX_CONFIG_V11;
+              
+              const buildApiUrl = (conf) => `${_CONVERTER}/sub?target=${type}&url=${encodeURIComponent(subUrl)}&config=${encodeURIComponent(conf)}&emoji=true&list=false&sort=false&fdn=false&scv=false`;
+
               try {
-                  // 🟢 关键修复：添加 User-Agent 头，防止转换服务器拒绝
-                  const res = await fetch(subApi, {
-                      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' }
-                  });
-                  // 如果返回正常且不为空，直接返回
+                  let subApi = buildApiUrl(config);
+                  let res = await fetch(subApi, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+
+                  // ⚠️ 关键修改：如果当前是 singbox 且 V11 请求失败 (非 200)，自动切换到 V12 重试
+                  if (!res.ok && type === 'singbox' && config === SINGBOX_CONFIG_V11) {
+                      config = SINGBOX_CONFIG_V12;
+                      subApi = buildApiUrl(config);
+                      res = await fetch(subApi, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+                  }
+
                   if (res.ok) {
-                      return new Response(res.body, { status: 200, headers: res.headers });
+                      const newHeaders = new Headers(res.headers);
+                      newHeaders.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+                      newHeaders.set('Pragma', 'no-cache');
+                      newHeaders.set('Expires', '0');
+                      return new Response(res.body, { status: 200, headers: newHeaders });
                   }
               } catch(e) {}
           }
 
-          // 🟢 如果 UA 识别失败，或者转换失败，回退到本地逻辑
+          // 🟢 常规订阅 fallback
           try {
             if (host.toLowerCase() !== _SUB_DOMAIN.toLowerCase()) {
                 const res = await fetch(subUrl, { headers: { 'User-Agent': UA } });
@@ -986,19 +909,19 @@ export default {
                             body = btoa(modified); 
                         } catch(e) {}
                     }
-                    return new Response(body, { status: 200, headers: res.headers });
+                    return new Response(body, { status: 200, headers: strictCacheHeaders });
                 }
             }
         } catch(e) {}
 
           const allIPs = await getCustomIPs(env);
           const listText = genNodes(host, _UUID, requestProxyIp, allIPs, _PS);
-          return new Response(btoa(unescape(encodeURIComponent(listText))), { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+          return new Response(btoa(unescape(encodeURIComponent(listText))), { status: 200, headers: strictCacheHeaders });
       }
 
       // 🟢 常规订阅 /sub
       if (url.pathname === '/sub') {
-          ctx.waitUntil(logAccess(env, clientIP, `${city},${country}`, "常规订阅"));
+          logAccess(env, ctx, clientIP, `${city},${country}`, "常规订阅");
           const requestUUID = url.searchParams.get('uuid');
           if (requestUUID.toLowerCase() !== _UUID.toLowerCase()) return new Response('Invalid UUID', { status: 403 });
           
@@ -1008,35 +931,27 @@ export default {
           
           const allIPs = await getCustomIPs(env);
           const listText = genNodes(host, _UUID, proxyIp, allIPs, _PS);
-          return new Response(btoa(unescape(encodeURIComponent(listText))), { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+          return new Response(btoa(unescape(encodeURIComponent(listText))), { status: 200, headers: strictCacheHeaders });
       }
 
-      // 🟢 面板逻辑 (HTTP)
+      // 🟢 面板逻辑
       if (r.headers.get('Upgrade') !== 'websocket') {
-        const noCacheHeaders = { 
+        const panelHeaders = { 
             'Content-Type': 'text/html; charset=utf-8', 
-            'Cache-Control': 'no-store',
+            'Cache-Control': 'no-store, no-cache, must-revalidate',
             'X-Frame-Options': 'DENY', 
             'X-Content-Type-Options': 'nosniff',
             'Referrer-Policy': 'same-origin'
         };
         
         if (!hasAuthCookie) {
-            return new Response(loginPage(TG_GROUP_URL, TG_CHANNEL_URL), { status: 200, headers: noCacheHeaders });
+            return new Response(loginPage(TG_GROUP_URL, TG_CHANNEL_URL), { status: 200, headers: panelHeaders });
         }
 
           await sendTgMsg(ctx, env, "✅ 后台登录成功", r, "进入管理面板", true); 
-          ctx.waitUntil(logAccess(env, clientIP, `${city},${country}`, "登录后台"));
+          logAccess(env, ctx, clientIP, `${city},${country}`, "登录后台");
           
-          const sysParams = {
-              tgToken: env.TG_BOT_TOKEN || TG_BOT_TOKEN,
-              tgId: env.TG_CHAT_ID || TG_CHAT_ID,
-              cfId: env.CF_ID || "",
-              cfToken: env.CF_TOKEN || "",
-              cfMail: env.CF_EMAIL || "",
-              cfKey: env.CF_KEY || ""
-          };
-
+          const sysParams = { tgToken: env.TG_BOT_TOKEN || TG_BOT_TOKEN, tgId: env.TG_CHAT_ID || TG_CHAT_ID, cfId: env.CF_ID || "", cfToken: env.CF_TOKEN || "", cfMail: env.CF_EMAIL || "", cfKey: env.CF_KEY || "" };
           const tgToken = await getSafeEnv(env, 'TG_BOT_TOKEN', TG_BOT_TOKEN);
           const tgId = await getSafeEnv(env, 'TG_CHAT_ID', TG_CHAT_ID);
           const cfId = await getSafeEnv(env, 'CF_ID', '');
@@ -1045,19 +960,27 @@ export default {
           const cfKey = await getSafeEnv(env, 'CF_KEY', '');
           const tgState = !!(tgToken && tgId);
           const cfState = (!!(cfId && cfToken)) || (!!(cfMail && cfKey));
-          
           const _ADD = await getSafeEnv(env, 'ADD', "");
           const _ADDAPI = await getSafeEnv(env, 'ADDAPI', "");
           const _ADDCSV = await getSafeEnv(env, 'ADDCSV', "");
 
-          return new Response(dashPage(url.hostname, _UUID, _PROXY_IP, _SUB_PW, _SUB_DOMAIN, _CONVERTER, env, clientIP, hasAuthCookie, tgState, cfState, _ADD, _ADDAPI, _ADDCSV, tgToken, tgId, cfId, cfToken, cfMail, cfKey, sysParams), { status: 200, headers: noCacheHeaders });
+          return new Response(dashPage(url.hostname, _UUID, _PROXY_IP, _SUB_PW, _SUB_DOMAIN, _CONVERTER, env, clientIP, hasAuthCookie, tgState, cfState, _ADD, _ADDAPI, _ADDCSV, tgToken, tgId, cfId, cfToken, cfMail, cfKey, sysParams), { status: 200, headers: panelHeaders });
       }
       
-      // 🟣 代理逻辑 (WebSocket) - 整合完整代理功能
-      const { proxyIP, socks5, enableSocks, globalProxy } = parseProxyConfig(url.pathname);
+      // 🟣 代理逻辑
+      let proxyIPConfig = null;
+      if (url.pathname.includes('/proxyip=')) {
+        try {
+          const proxyParam = url.pathname.split('/proxyip=')[1].split('/')[0];
+          const [address, port] = await parseIP(proxyParam); 
+          proxyIPConfig = { address, port: +port }; 
+        } catch (e) { console.error(e); }
+      }
       const { 0: c, 1: s } = new WebSocketPair();
-      s.accept();
-      handle(s, proxyIP, _UUID, socks5, enableSocks, globalProxy);
+      s.accept(); 
+      try {
+        handle(s, proxyIPConfig, _UUID); 
+      } catch(e) {}
       return new Response(null, { status: 101, webSocket: c });
   } catch (err) {
       return new Response(err.toString(), { status: 500 });
