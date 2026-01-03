@@ -14,6 +14,16 @@
 
 [stallTCPV1图文后台版](https://lh.hilh0923.hidns.co/lh/stallTCP1-3V1)
 
+**界面预览：** worker全新界面/snippets界面
+<img width="1920" height="916" alt="image" src="https://github.com/user-attachments/assets/c066513e-27aa-4a8d-a4a1-61d377b74142" />
+<img width="1920" height="911" alt="image" src="https://github.com/user-attachments/assets/b2fc6d97-3ba3-461b-9056-48db24b6e6ee" />
+<img width="1916" height="912" alt="image" src="https://github.com/user-attachments/assets/f87c1b8a-6f80-4bbd-9aa1-717bb120301d" />
+<img width="1913" height="906" alt="image" src="https://github.com/user-attachments/assets/592442d4-9f60-49ab-b42c-dc097e8fa35f" />
+<img width="1914" height="913" alt="image" src="https://github.com/user-attachments/assets/56a879cf-d331-44dc-a5bd-5ba2a078432c" />
+<img width="100%" alt="image" src="https://github.com/user-attachments/assets/e43db73f-4d8d-41a3-ab43-61555c8c984b" />
+<img width="1920" height="918" alt="image" src="https://github.com/user-attachments/assets/609af76b-99ae-4fe6-ac08-1878ca34f369" />
+<img width="1920" height="918" alt="image" src="https://github.com/user-attachments/assets/84bf305e-7072-403e-8389-628349a29e3f" />
+
 
 # 懒人食用指南：
 > * **snippets代码 所有数据都需要在代码顶部【用户配置区域进行修改】**
@@ -285,10 +295,7 @@ CREATE TABLE IF NOT EXISTS stats (date TEXT PRIMARY KEY, count INTEGER DEFAULT 0
     *   查看最近 50 条访问日志（从 D1/KV 读取）。
     *   集成 ProxyIP 连通性检测。
 
-**界面预览：** worker全新界面/snippets界面
-<img width="100%" alt="image" src="https://github.com/user-attachments/assets/e43db73f-4d8d-41a3-ab43-61555c8c984b" />
-<img width="1920" height="918" alt="image" src="https://github.com/user-attachments/assets/609af76b-99ae-4fe6-ac08-1878ca34f369" />
-<img width="1920" height="918" alt="image" src="https://github.com/user-attachments/assets/84bf305e-7072-403e-8389-628349a29e3f" />
+
 
 ---
 
